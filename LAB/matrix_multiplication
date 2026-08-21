@@ -1,16 +1,3 @@
-/*
-matrix_multiplication.c
-
-Simple C program to multiply two matrices.
-
-Compile:
-  gcc -std=c11 -O2 -Wall -o matrix_multiplication matrix_multiplication.c
-
-Run:
-  ./matrix_multiplication
-
-The program reads dimensions and elements from stdin. Example interaction is in the repository README.
-*/
 
 #include <stdio.h>
 #include <stdlib.h>

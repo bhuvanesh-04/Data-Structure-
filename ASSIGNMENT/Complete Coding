@@ -1,0 +1,1262 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <stdint.h>
+
+#define MAX_IP_LEN 16
+#define MAX_TYPE_LEN 24
+#define DEMO_EVENTS 12
+
+/* ----------------------------- Event model ----------------------------- */
+typedef struct {
+    char ip[MAX_IP_LEN];
+    unsigned long timestamp;
+    char type[MAX_TYPE_LEN];
+    int risk;
+    unsigned long seq;
+} Event;
+
+/* ---------------------------- Hash table ------------------------------- */
+typedef struct HashNode {
+    char ip[MAX_IP_LEN];
+    unsigned long count;
+    struct HashNode *next;
+} HashNode;
+
+typedef struct {
+    HashNode **buckets;
+    size_t size;
+    size_t items;
+    size_t collisions;
+} HashTable;
+
+/* FNV-1a hash function */
+static uint64_t fnv1a(const char *s) {
+    uint64_t h = 1469598103934665603ULL;
+
+    while (*s) {
+        h ^= (unsigned char)*s++;
+        h *= 1099511628211ULL;
+    }
+
+    return h;
+}
+
+/* Create hash table */
+static HashTable *hash_create(size_t size) {
+    HashTable *t = (HashTable *)calloc(1, sizeof(HashTable));
+
+    if (!t)
+        return NULL;
+
+    t->size = size;
+    t->buckets = (HashNode **)calloc(size, sizeof(HashNode *));
+
+    if (!t->buckets) {
+        free(t);
+        return NULL;
+    }
+
+    return t;
+}
+
+/*
+ * Insert/update IP address.
+ * Returns previous occurrence count.
+ * Uses separate chaining for collision resolution.
+ */
+static unsigned long hash_touch(HashTable *t, const char *ip) {
+
+    size_t idx = (size_t)(fnv1a(ip) % t->size);
+
+    HashNode *cur = t->buckets[idx];
+
+    if (cur)
+        t->collisions++;
+
+    while (cur) {
+
+        if (strcmp(cur->ip, ip) == 0) {
+            unsigned long prev = cur->count;
+            cur->count++;
+            return prev;
+        }
+
+        cur = cur->next;
+    }
+
+    HashNode *node = (HashNode *)calloc(1, sizeof(HashNode));
+
+    if (!node)
+        return 0;
+
+    strncpy(node->ip, ip, MAX_IP_LEN - 1);
+
+    node->count = 1;
+
+    node->next = t->buckets[idx];
+
+    t->buckets[idx] = node;
+
+    t->items++;
+
+    return 0;
+}
+
+/* Search for IP occurrence count */
+static unsigned long hash_count(const HashTable *t, const char *ip) {
+
+    size_t idx = (size_t)(fnv1a(ip) % t->size);
+
+    HashNode *cur = t->buckets[idx];
+
+    while (cur) {
+
+        if (strcmp(cur->ip, ip) == 0)
+            return cur->count;
+
+        cur = cur->next;
+    }
+
+    return 0;
+}
+
+/* Free hash table */
+static void hash_free(HashTable *t) {
+
+    if (!t)
+        return;
+
+    for (size_t i = 0; i < t->size; ++i) {
+
+        HashNode *cur = t->buckets[i];
+
+        while (cur) {
+
+            HashNode *next = cur->next;
+
+            free(cur);
+
+            cur = next;
+        }
+    }
+
+    free(t->buckets);
+
+    free(t);
+}
+
+
+/* ------------------------------- AVL tree ------------------------------ */
+
+typedef struct AVLNode {
+
+    Event event;
+
+    int height;
+
+    struct AVLNode *left;
+    struct AVLNode *right;
+
+} AVLNode;
+
+/* Get height */
+static int avl_height(const AVLNode *n) {
+
+    return n ? n->height : 0;
+}
+
+/* Maximum of two integers */
+static int max_int(int a, int b) {
+
+    return a > b ? a : b;
+}
+
+/* Update node height */
+static void avl_update(AVLNode *n) {
+
+    n->height =
+        1 + max_int(
+            avl_height(n->left),
+            avl_height(n->right)
+        );
+}
+
+
+/* Right rotation */
+static AVLNode *rotate_right(AVLNode *y) {
+
+    AVLNode *x = y->left;
+
+    AVLNode *t = x->right;
+
+    x->right = y;
+
+    y->left = t;
+
+    avl_update(y);
+
+    avl_update(x);
+
+    return x;
+}
+
+
+/* Left rotation */
+static AVLNode *rotate_left(AVLNode *x) {
+
+    AVLNode *y = x->right;
+
+    AVLNode *t = y->left;
+
+    y->left = x;
+
+    x->right = t;
+
+    avl_update(x);
+
+    avl_update(y);
+
+    return y;
+}
+
+
+/*
+ * Compare two events.
+ *
+ * Higher risk has higher priority.
+ * For equal risk, earlier timestamp has higher priority.
+ */
+static int event_cmp(const Event *a, const Event *b) {
+
+    if (a->risk != b->risk)
+        return (a->risk > b->risk) ? 1 : -1;
+
+    if (a->timestamp != b->timestamp)
+        return (a->timestamp < b->timestamp) ? 1 : -1;
+
+    if (a->seq != b->seq)
+        return (a->seq < b->seq) ? 1 : -1;
+
+    return strcmp(a->ip, b->ip);
+}
+
+
+/* AVL insertion */
+static AVLNode *avl_insert(AVLNode *root, Event e) {
+
+    if (!root) {
+
+        AVLNode *n =
+            (AVLNode *)calloc(1, sizeof(AVLNode));
+
+        if (!n)
+            return NULL;
+
+        n->event = e;
+
+        n->height = 1;
+
+        return n;
+    }
+
+
+    if (event_cmp(&e, &root->event) < 0)
+
+        root->left =
+            avl_insert(root->left, e);
+
+    else
+
+        root->right =
+            avl_insert(root->right, e);
+
+
+    avl_update(root);
+
+
+    int balance =
+        avl_height(root->left)
+        -
+        avl_height(root->right);
+
+
+    /* Left Left case */
+    if (balance > 1 &&
+        event_cmp(&e, &root->left->event) < 0)
+
+        return rotate_right(root);
+
+
+    /* Right Right case */
+    if (balance < -1 &&
+        event_cmp(&e, &root->right->event) > 0)
+
+        return rotate_left(root);
+
+
+    /* Left Right case */
+    if (balance > 1 &&
+        event_cmp(&e, &root->left->event) > 0) {
+
+        root->left =
+            rotate_left(root->left);
+
+        return rotate_right(root);
+    }
+
+
+    /* Right Left case */
+    if (balance < -1 &&
+        event_cmp(&e, &root->right->event) < 0) {
+
+        root->right =
+            rotate_right(root->right);
+
+        return rotate_left(root);
+    }
+
+
+    return root;
+}
+
+
+/*
+ * Reverse inorder traversal.
+ * Produces events from highest risk to lowest risk.
+ */
+static void avl_reverse_inorder(
+    const AVLNode *root,
+    int *printed,
+    int limit
+) {
+
+    if (!root || *printed >= limit)
+        return;
+
+
+    avl_reverse_inorder(
+        root->right,
+        printed,
+        limit
+    );
+
+
+    if (*printed < limit) {
+
+        printf(
+            "  risk=%d ip=%s type=%s count-seq=%lu\n",
+            root->event.risk,
+            root->event.ip,
+            root->event.type,
+            root->event.seq
+        );
+
+        (*printed)++;
+    }
+
+
+    avl_reverse_inorder(
+        root->left,
+        printed,
+        limit
+    );
+}
+
+
+/* Free AVL tree */
+static void avl_free(AVLNode *root) {
+
+    if (!root)
+        return;
+
+    avl_free(root->left);
+
+    avl_free(root->right);
+
+    free(root);
+}
+
+
+/* ----------------------------- Max priority queue --------------------- */
+
+typedef struct {
+
+    Event *a;
+
+    size_t n;
+
+    size_t cap;
+
+} MaxHeap;
+
+
+/* Compare priority */
+static int higher(
+    const Event *a,
+    const Event *b
+) {
+
+    return event_cmp(a, b) > 0;
+}
+
+
+/* Swap two events */
+static void heap_swap(
+    Event *a,
+    Event *b
+) {
+
+    Event t = *a;
+
+    *a = *b;
+
+    *b = t;
+}
+
+
+/* Create heap */
+static MaxHeap *heap_create(size_t cap) {
+
+    MaxHeap *h =
+        (MaxHeap *)calloc(1, sizeof(MaxHeap));
+
+    if (!h)
+        return NULL;
+
+
+    h->cap = cap ? cap : 16;
+
+
+    h->a =
+        (Event *)malloc(
+            h->cap * sizeof(Event)
+        );
+
+
+    if (!h->a) {
+
+        free(h);
+
+        return NULL;
+    }
+
+
+    return h;
+}
+
+
+/* Insert event into max heap */
+static int heap_push(
+    MaxHeap *h,
+    Event e
+) {
+
+    if (h->n == h->cap) {
+
+        size_t newcap =
+            h->cap * 2;
+
+
+        Event *tmp =
+            (Event *)realloc(
+                h->a,
+                newcap * sizeof(Event)
+            );
+
+
+        if (!tmp)
+            return 0;
+
+
+        h->a = tmp;
+
+        h->cap = newcap;
+    }
+
+
+    size_t i = h->n++;
+
+    h->a[i] = e;
+
+
+    /* Heapify upward */
+    while (i > 0) {
+
+        size_t p =
+            (i - 1) / 2;
+
+
+        if (!higher(
+                &h->a[i],
+                &h->a[p]
+            ))
+
+            break;
+
+
+        heap_swap(
+            &h->a[i],
+            &h->a[p]
+        );
+
+
+        i = p;
+    }
+
+
+    return 1;
+}
+
+
+/* Remove highest-priority event */
+static int heap_pop(
+    MaxHeap *h,
+    Event *out
+) {
+
+    if (!h->n)
+        return 0;
+
+
+    *out = h->a[0];
+
+
+    h->a[0] =
+        h->a[--h->n];
+
+
+    size_t i = 0;
+
+
+    /* Heapify downward */
+    while (1) {
+
+        size_t l =
+            2 * i + 1;
+
+        size_t r =
+            l + 1;
+
+        size_t best = i;
+
+
+        if (
+            l < h->n &&
+            higher(
+                &h->a[l],
+                &h->a[best]
+            )
+        )
+
+            best = l;
+
+
+        if (
+            r < h->n &&
+            higher(
+                &h->a[r],
+                &h->a[best]
+            )
+        )
+
+            best = r;
+
+
+        if (best == i)
+            break;
+
+
+        heap_swap(
+            &h->a[i],
+            &h->a[best]
+        );
+
+
+        i = best;
+    }
+
+
+    return 1;
+}
+
+
+/* Free heap */
+static void heap_free(MaxHeap *h) {
+
+    if (h) {
+
+        free(h->a);
+
+        free(h);
+    }
+}
+
+
+/* ------------------------------ Engine --------------------------------- */
+
+typedef struct {
+
+    HashTable *hash;
+
+    AVLNode *avl;
+
+    MaxHeap *heap;
+
+    unsigned long next_seq;
+
+} Engine;
+
+
+/* Create complete detection engine */
+static Engine *engine_create(
+    size_t hash_buckets
+) {
+
+    Engine *e =
+        (Engine *)calloc(
+            1,
+            sizeof(Engine)
+        );
+
+
+    if (!e)
+        return NULL;
+
+
+    e->hash =
+        hash_create(hash_buckets);
+
+
+    e->heap =
+        heap_create(16);
+
+
+    if (!e->hash || !e->heap) {
+
+        hash_free(e->hash);
+
+        heap_free(e->heap);
+
+        free(e);
+
+        return NULL;
+    }
+
+
+    return e;
+}
+
+
+/* Process security event */
+static int engine_process(
+    Engine *e,
+    Event ev
+) {
+
+    ev.seq =
+        e->next_seq++;
+
+
+    /* Duplicate detection */
+    hash_touch(
+        e->hash,
+        ev.ip
+    );
+
+
+    /* Ordered risk storage */
+    e->avl =
+        avl_insert(
+            e->avl,
+            ev
+        );
+
+
+    /* Highest-risk event ranking */
+    return heap_push(
+        e->heap,
+        ev
+    );
+}
+
+
+/* Free engine */
+static void engine_free(Engine *e) {
+
+    if (!e)
+        return;
+
+
+    hash_free(e->hash);
+
+    avl_free(e->avl);
+
+    heap_free(e->heap);
+
+    free(e);
+}
+
+
+/* ----------------------------- Benchmark -------------------------------- */
+
+
+/*
+ * Generate IP addresses.
+ *
+ * Uniform:
+ *   IPs are distributed over a large address space.
+ *
+ * Skewed:
+ *   A small set of IPs generates most events.
+ */
+static void make_ip(
+    char *buf,
+    unsigned long i,
+    int skewed
+) {
+
+    if (skewed) {
+
+        /*
+         * 20% of IPs generate
+         * approximately 80% of traffic.
+         */
+
+        unsigned long id =
+            (i % 10 < 8)
+            ? (i % 2000)
+            : (2000 + i % 8000);
+
+
+        snprintf(
+            buf,
+            MAX_IP_LEN,
+            "10.%lu.%lu.%lu",
+            (id >> 16) & 255UL,
+            (id >> 8) & 255UL,
+            id & 255UL
+        );
+
+    } else {
+
+        unsigned long id =
+            i % 900000;
+
+
+        snprintf(
+            buf,
+            MAX_IP_LEN,
+            "10.%lu.%lu.%lu",
+            (id >> 16) & 255UL,
+            (id >> 8) & 255UL,
+            id & 255UL
+        );
+    }
+}
+
+
+/* Calculate elapsed CPU time */
+static double elapsed(
+    clock_t a,
+    clock_t b
+) {
+
+    return
+        (double)(b - a)
+        /
+        (double)CLOCKS_PER_SEC;
+}
+
+
+/*
+ * Benchmark hash insertion and lookup.
+ */
+static void benchmark_hash(
+    size_t events,
+    double load_factor,
+    int skewed
+) {
+
+    size_t distinct_target =
+        skewed
+        ? 3200
+        : 900000;
+
+
+    size_t desired_items =
+        events < distinct_target
+        ? events
+        : distinct_target;
+
+
+    size_t buckets =
+        (size_t)(
+            (double)desired_items
+            /
+            load_factor
+        );
+
+
+    if (buckets < 17)
+        buckets = 17;
+
+
+    HashTable *t =
+        hash_create(buckets);
+
+
+    if (!t) {
+
+        fprintf(
+            stderr,
+            "Allocation failure\n"
+        );
+
+        exit(EXIT_FAILURE);
+    }
+
+
+    char ip[MAX_IP_LEN];
+
+
+    /* ---------------- INSERTION TEST ---------------- */
+
+    clock_t t0 = clock();
+
+
+    for (
+        size_t i = 0;
+        i < events;
+        ++i
+    ) {
+
+        make_ip(
+            ip,
+            (unsigned long)i,
+            skewed
+        );
+
+
+        hash_touch(
+            t,
+            ip
+        );
+    }
+
+
+    clock_t t1 = clock();
+
+
+    /* ---------------- LOOKUP TEST ---------------- */
+
+    volatile unsigned long sink = 0;
+
+
+    for (
+        size_t i = 0;
+        i < events;
+        ++i
+    ) {
+
+        make_ip(
+            ip,
+            (unsigned long)(
+                events - 1 - i
+            ),
+            skewed
+        );
+
+
+        sink ^=
+            hash_count(
+                t,
+                ip
+            );
+    }
+
+
+    (void)sink;
+
+
+    clock_t t2 = clock();
+
+
+    /*
+     * CSV-style output:
+     *
+     * events,
+     * load factor,
+     * distribution,
+     * buckets,
+     * distinct IPs,
+     * insertion time,
+     * lookup time,
+     * collisions
+     */
+
+    printf(
+        "%zu,%.2f,%s,%zu,%zu,%.4f,%.4f,%zu\n",
+        events,
+        load_factor,
+        skewed
+            ? "skewed"
+            : "uniform",
+        t->size,
+        t->items,
+        elapsed(t0, t1),
+        elapsed(t1, t2),
+        t->collisions
+    );
+
+
+    hash_free(t);
+}
+
+
+/* Run complete benchmark */
+static void run_benchmarks(void) {
+
+    const size_t sizes[] = {
+        10000,
+        100000,
+        1000000
+    };
+
+
+    const double loads[] = {
+        0.50,
+        0.75,
+        0.90
+    };
+
+
+    puts(
+        "events,load_factor,"
+        "distribution,buckets,"
+        "distinct_ips,"
+        "insert_seconds,"
+        "lookup_seconds,"
+        "collision_events"
+    );
+
+
+    for (
+        size_t s = 0;
+        s < sizeof(sizes) / sizeof(sizes[0]);
+        ++s
+    ) {
+
+        for (
+            size_t l = 0;
+            l < sizeof(loads) / sizeof(loads[0]);
+            ++l
+        ) {
+
+            /* Uniform distribution */
+            benchmark_hash(
+                sizes[s],
+                loads[l],
+                0
+            );
+
+
+            /* Skewed distribution */
+            benchmark_hash(
+                sizes[s],
+                loads[l],
+                1
+            );
+        }
+    }
+}
+
+
+/* ----------------------------- Demonstration ---------------------------- */
+
+static void run_demo(void) {
+
+    Engine *e =
+        engine_create(101);
+
+
+    if (!e) {
+
+        fprintf(
+            stderr,
+            "Engine allocation failure\n"
+        );
+
+        exit(EXIT_FAILURE);
+    }
+
+
+    /*
+     * Sample cybersecurity events.
+     */
+    const Event demo[DEMO_EVENTS] = {
+
+        {
+            "192.168.1.10",
+            1001,
+            "LOGIN_FAIL",
+            75,
+            0
+        },
+
+        {
+            "10.0.0.5",
+            1002,
+            "PORT_SCAN",
+            92,
+            0
+        },
+
+        {
+            "192.168.1.10",
+            1003,
+            "LOGIN_FAIL",
+            88,
+            0
+        },
+
+        {
+            "10.0.0.7",
+            1004,
+            "ACCESS_REQ",
+            45,
+            0
+        },
+
+        {
+            "10.0.0.5",
+            1005,
+            "BRUTE_FORCE",
+            98,
+            0
+        },
+
+        {
+            "172.16.1.4",
+            1006,
+            "DNS_ANOMALY",
+            64,
+            0
+        },
+
+        {
+            "192.168.1.10",
+            1007,
+            "LOGIN_FAIL",
+            90,
+            0
+        },
+
+        {
+            "10.0.0.8",
+            1008,
+            "ACCESS_REQ",
+            35,
+            0
+        },
+
+        {
+            "10.0.0.5",
+            1009,
+            "PORT_SCAN",
+            95,
+            0
+        },
+
+        {
+            "172.16.1.4",
+            1010,
+            "DNS_ANOMALY",
+            70,
+            0
+        },
+
+        {
+            "10.0.0.7",
+            1011,
+            "ACCESS_REQ",
+            52,
+            0
+        },
+
+        {
+            "192.168.1.99",
+            1012,
+            "MALWARE",
+            99,
+            0
+        }
+    };
+
+
+    printf(
+        "\n=== Real-Time Cyber Threat "
+        "Detection Engine ===\n"
+    );
+
+
+    /* Process all demonstration events */
+    for (
+        int i = 0;
+        i < DEMO_EVENTS;
+        ++i
+    ) {
+
+        engine_process(
+            e,
+            demo[i]
+        );
+    }
+
+
+    printf(
+        "Processed events      : %d\n",
+        DEMO_EVENTS
+    );
+
+
+    printf(
+        "Distinct source IPs   : %zu\n",
+        e->hash->items
+    );
+
+
+    printf(
+        "Hash collision events : %zu\n",
+        e->hash->collisions
+    );
+
+
+    /* ---------------- Duplicate IP Detection ---------------- */
+
+    printf(
+        "Duplicate IP checks   :\n"
+    );
+
+
+    const char *check_ips[] = {
+
+        "192.168.1.10",
+
+        "10.0.0.5",
+
+        "8.8.8.8"
+    };
+
+
+    for (
+        int i = 0;
+        i < 3;
+        ++i
+    ) {
+
+        printf(
+            "  %s -> %lu occurrence(s)\n",
+            check_ips[i],
+            hash_count(
+                e->hash,
+                check_ips[i]
+            )
+        );
+    }
+
+
+    /* ---------------- Priority Queue ---------------- */
+
+    printf(
+        "\nTop events from "
+        "priority queue:\n"
+    );
+
+
+    for (
+        int i = 0;
+        i < 5;
+        ++i
+    ) {
+
+        Event top;
+
+
+        if (
+            !heap_pop(
+                e->heap,
+                &top
+            )
+        )
+
+            break;
+
+
+        printf(
+            "  risk=%d ip=%s "
+            "type=%s timestamp=%lu\n",
+            top.risk,
+            top.ip,
+            top.type,
+            top.timestamp
+        );
+    }
+
+
+    /* ---------------- AVL Tree ---------------- */
+
+    printf(
+        "\nHighest-risk ordered "
+        "events from AVL tree:\n"
+    );
+
+
+    int printed = 0;
+
+
+    avl_reverse_inorder(
+        e->avl,
+        &printed,
+        5
+    );
+
+
+    engine_free(e);
+}
+
+
+/* ----------------------------- Main Function ---------------------------- */
+
+int main(
+    int argc,
+    char **argv
+) {
+
+    /*
+     * Default:
+     *     Run demonstration.
+     *
+     * With "bench":
+     *     Run performance benchmark.
+     */
+
+    if (
+        argc > 1 &&
+        strcmp(
+            argv[1],
+            "bench"
+        ) == 0
+    ) {
+
+        run_benchmarks();
+
+    } else {
+
+        run_demo();
+    }
+
+
+    return 0;
+}
